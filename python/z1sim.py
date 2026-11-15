@@ -12,7 +12,9 @@ machine off. Not a faithful Smoothieware: just enough G-code for jogging, zeroin
     else just gets "ok". Replies are 0x90 "ok\\r\\n".
   * Motion runs in real time at the commanded feed (G0 = axis max rate) x feed override, with a
     32-block planner queue; soft limits X -207..-1, Y -206..-1, Z -102..-1 once homed;
-    $H ends at MPos -1 on X, Y and Z, like the real Z1.
+    $H ends at MPos -1 on X, Y and Z, like the real Z1, and like it answers "ok" only once homing is
+    done (the slow switch touch and back-off take ~2 s more here; ~3.9 s in all from home on the Z1).
+    A halt (0x18) during homing: "ALARM: Abort during cycle", "ALARM: Homing fail", then the $H's "ok".
 """
 from __future__ import annotations
 
@@ -32,6 +34,7 @@ AXES = "XYZA"
 MAX_RATE = {"X": 3000.0, "Y": 3000.0, "Z": 1000.0, "A": 1800.0}   # mm/min (deg/min for A)
 SOFT = {"X": (-207.0, -1.0), "Y": (-206.0, -1.0), "Z": (-102.0, -1.0)}
 QUEUE_MAX = 32
+HOME_TOUCH_S = 2.0      # homing's slow switch touch and back-off, after the fast moves
 QUEUE_DELAY_S = 0.100   # Smoothie conveyor queue_delay_time_ms default: a queue that was empty waits this long
 
 
@@ -74,6 +77,8 @@ class Machine:
         t = text.strip().upper().replace(" ", "")
         if not t:
             return ["ok\r\n"]
+        if t == "$H":
+            return self._home_cmd()
         with self.lock:
             if t.startswith("PLAY"):
                 return self.play(text.strip()[4:].strip())
@@ -83,12 +88,6 @@ class Machine:
                 return ["ok\r\n"]
             if self.state == "Alarm":
                 return ["error:Alarm lock\r\n"]
-            if t == "$H":
-                self.queue.clear()
-                self.cur = None
-                self.state = "Home"
-                threading.Thread(target=self._home, daemon=True).start()
-                return ["ok\r\n"]
             words = re.findall(r"([A-Z])([-+]?\d*\.?\d*)", t)
             g = [float(v) for k, v in words if k == "G" and v]
             m = [float(v) for k, v in words if k == "M" and v]
@@ -267,6 +266,21 @@ class Machine:
             self.queue.clear()
             self.cur = None
 
+    def _home_cmd(self) -> list[str]:
+        with self.lock:
+            if self.state == "Alarm":
+                return ["error:Alarm lock\r\n"]
+            self.queue.clear()
+            self.cur = None
+            self.state = "Home"
+            threading.Thread(target=self._home, daemon=True).start()
+        # The Z1 answers $H when homing is over (lines after it wait), also when a halt cut it short.
+        while True:
+            time.sleep(0.01)
+            with self.lock:
+                if self.state != "Home":
+                    return ["ALARM: Homing fail\n", "ok\r\n"] if self.state == "Alarm" else ["ok\r\n"]
+
     def _home(self):
         while True:
             with self.lock:
@@ -283,10 +297,18 @@ class Machine:
                         self.mpos[i] = home if abs(d) <= step else self.mpos[i] + math.copysign(step, d)
                         done = False
                 if done:
-                    self.homed = True
-                    self.state = "Idle"
-                    return
+                    break
             time.sleep(0.01)
+        end = time.time() + HOME_TOUCH_S
+        while time.time() < end:
+            time.sleep(0.01)
+            with self.lock:
+                if self.state != "Home":
+                    return
+        with self.lock:
+            if self.state == "Home":
+                self.homed = True
+                self.state = "Idle"
 
     # --- motion thread ------------------------------------------------------------------
     def run(self):
@@ -474,8 +496,7 @@ class Client(threading.Thread):
                     elif c == P.RT_RESUME:
                         self.m.hold = False
                     elif c == P.RT_HALT:
-                        self.m.halt()
-                        self.tx(P.NORMAL_INFO, "ERROR: Abort during cycle\r\n")
+                        self.m.halt()           # the Z1 says "ALARM: Abort during cycle" (sent from msgs)
                     elif c == P.RT_STOP:
                         self.m.stop()
                 elif ptype == P.CTRL_MULTI and payload.strip() == b"diagnose":

@@ -84,6 +84,8 @@ class JobSimTest {
         withTimeout(5000) { while (link.conn.value != ConnState.Connected) delay(20) }
         // Home, set a work zero mid-table, leave overrides off 100 %, then play.
         for (l in listOf("\$H", "G53 G0 X-100 Y-100 Z-60", "G10L20P0X0Y0Z0", "M220 S120", "M3 S6000", "M223 S85", "M5")) link.sendLine(l)
+        // \$H is answered once homing is done (like the Z1), and the lines after it wait for that.
+        withTimeout(15_000) { while (link.pendingLines > 0) delay(50) }
         withTimeout(15_000) { while (link.status.value?.let { it.isIdle && it.mpos[0] == -100.0 } != true) delay(50) }
         delay(500)
         assertEquals(85.0, link.status.value!!.spindleOverride!!, 0.01)
@@ -114,6 +116,8 @@ class JobSimTest {
         vm.connect(target)
         withTimeout(5000) { while (link.conn.value != ConnState.Connected) delay(20) }
         for (l in listOf("\$H", "G53 G0 X-100 Y-100 Z-60", "G10L20P0X0Y0Z0", "M3 S6000", "M223 S85", "M5")) link.sendLine(l)
+        // \$H is answered once homing is done (like the Z1), and the lines after it wait for that.
+        withTimeout(15_000) { while (link.pendingLines > 0) delay(50) }
         withTimeout(15_000) { while (link.status.value?.let { it.isIdle && it.mpos[0] == -100.0 } != true) delay(50) }
         link.sendLine("play t.cnc")
         withTimeout(10_000) { while (vm.job.value == null) delay(20) }

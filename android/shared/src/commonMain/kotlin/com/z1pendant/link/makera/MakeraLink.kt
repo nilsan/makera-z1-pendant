@@ -43,9 +43,9 @@ import kotlinx.coroutines.withTimeout
 /**
  * Stock Makera Z1 over Wi-Fi: the ESP32 bridges TCP 2222 straight to the LPC's UART.
  *
- * Flow control: lines go out one at a time (window 2) and each waits for its "ok"/"error" reply.
- * If the machine never acks (unverified on stock firmware), the link drops to timed spacing so
- * nothing jams. A status query goes out every [pollMs]; no reply for [lossMs] = link lost, and
+ * Flow control: up to two lines are out at a time, and each waits for its "ok"/"error" reply, however
+ * long that takes (`$H` answers once homing is done). Replies come back in order, so the first one
+ * belongs to the oldest line out. A status query goes out every [pollMs]; no reply for [lossMs] = link lost, and
  * the link reconnects by itself.
  *
  * Sockets are ktor-network (the same code on Android and iOS).
@@ -129,7 +129,11 @@ class MakeraLink(private val scope: CoroutineScope = CoroutineScope(SupervisorJo
         scope.launch { sendRaw(MakeraFrame.build(MakeraFrame.JOB_FILE, ByteArray(0))) }
     }
 
-    private class Pending(val line: String, val quiet: Boolean, val onAck: ((Boolean, String) -> Unit)?, var sentAt: Long = 0)
+    private class Pending(val line: String, val quiet: Boolean, val onAck: ((Boolean, String) -> Unit)?, var sentAt: Long = 0) {
+        var slowLogged = false
+        /** Cancelled by a reset while out: already reported as failed; until this time it still takes its late reply. */
+        var ghostUntil = 0L
+    }
 
     private val lock = SynchronizedObject()
     /** One frame at a time on the socket. */
@@ -148,7 +152,10 @@ class MakeraLink(private val scope: CoroutineScope = CoroutineScope(SupervisorJo
     @Volatile var acksSeen: Boolean? = null; private set
 
     private val window = 2
-    private val ackTimeoutMs = 4000L
+    /** A line out this long without a reply is logged (once); it keeps waiting. */
+    private val slowAckMs = 4000L
+    /** How long a line cancelled by a reset may still get its reply (on the Z1, `$H`'s came 80 ms after). */
+    private val ghostMs = 1000L
     private val lossMs = 1500L
 
     override val pendingLines: Int get() = synchronized(lock) { queue.size + inFlight.size }
@@ -245,15 +252,18 @@ class MakeraLink(private val scope: CoroutineScope = CoroutineScope(SupervisorJo
             }
             var toSend: Pending? = null
             synchronized(lock) {
-                // Ack timeouts: release the slot so a missing "ok" never jams the pendant.
-                // Confirmed on the Z1 (fw 1.1.3.0.1.13): G-code / $ lines get "ok"; a timeout here
-                // means something is wrong, so it's logged but never changes the flow-control mode.
-                while (inFlight.isNotEmpty() && now - inFlight.first().sentAt > ackTimeoutMs) {
-                    val p = inFlight.removeFirst()
-                    PLog.w(TAG, "no ok for '${p.line}' in $ackTimeoutMs ms")
-                    p.onAck?.invoke(true, "")
+                // No timeout on replies: the Z1 (fw 1.1.3.0.1.13) answers every G-code / $ line, but
+                // some only when done ($H after homing, ~4 s even from the home position). Giving up
+                // on one would hand its late "ok" to the next line.
+                for (p in inFlight) if (!p.slowLogged && p.ghostUntil == 0L && now - p.sentAt > slowAckMs) {
+                    p.slowLogged = true
+                    PLog.w(TAG, "no reply for '${p.line}' after $slowAckMs ms, still waiting")
                 }
-                if (queue.isNotEmpty() && inFlight.size < window) {
+                // Lines cancelled by a reset whose reply never came: stop waiting for it.
+                while (inFlight.firstOrNull()?.let { it.ghostUntil in 1..now } == true) inFlight.removeFirst()
+                val ghosts = inFlight.any { it.ghostUntil != 0L }
+                // Nothing new goes out while a reset's late replies may still come, or one would be taken as its.
+                if (!ghosts && queue.isNotEmpty() && inFlight.size < window) {
                     val p = queue.removeFirst()
                     p.sentAt = now
                     // Shell commands (version, ls, …) reply with text and no "ok": don't wait for one,
@@ -310,7 +320,7 @@ class MakeraLink(private val scope: CoroutineScope = CoroutineScope(SupervisorJo
                     if (isOk || isErr) {
                         acksSeen = true
                         val p = synchronized(lock) { inFlight.removeFirstOrNull() }
-                        p?.onAck?.invoke(isOk, line)
+                        if (p != null && p.ghostUntil == 0L) p.onAck?.invoke(isOk, line)
                         if (isOk && p?.quiet == true) continue      // a jog move's "ok"
                     }
                     messages.tryEmit(line)
@@ -329,9 +339,20 @@ class MakeraLink(private val scope: CoroutineScope = CoroutineScope(SupervisorJo
 
     override fun feedHold() { rt('!'.code); sent.tryEmit("! (feed hold)") }
     override fun resume() { rt('~'.code); sent.tryEmit("~ (resume)") }
+    /**
+     * Lines waiting to go out and lines out without a reply all fail ("reset"). The lines out stay
+     * in line for up to [ghostMs]: on the Z1 a `$H` cut short by a reset still sends its "ok"
+     * afterwards, and that must not be taken as the next line's.
+     */
     override fun reset() {
-        synchronized(lock) { queue.clear() }
+        val until = nowMs() + ghostMs
+        val cancelled = synchronized(lock) {
+            val out = inFlight.filter { it.ghostUntil == 0L }
+            out.forEach { it.ghostUntil = until }
+            (out + queue).also { queue.clear() }
+        }
         rt(0x18); sent.tryEmit("Ctrl-X (reset)")
+        cancelled.forEach { it.onAck?.invoke(false, "reset") }
     }
 
     private fun rt(c: Int) { scope.launch { sendRaw(MakeraFrame.rt(c)) } }

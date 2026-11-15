@@ -104,6 +104,64 @@ class MakeraLinkSimTest {
         assertEquals("stays disconnected", ConnState.Disconnected, link.conn.value)
     }
 
+    /**
+     * Homing from far away takes more than 4 s, and the Z1 answers \$H only when it's done. The "ok"
+     * belongs to \$H (not reported early), and the line after it gets its own reply.
+     */
+    @Test fun slowHomingAnswerGoesToHoming() = runBlocking {
+        val link = MakeraLink()
+        link.connect(MachineTarget("sim", "127.0.0.1", port))
+        withTimeout(5000) { while (link.conn.value != ConnState.Connected) delay(20) }
+        link.sendLine("G0 X-200")
+        withTimeout(10000) { while (link.status.value?.let { it.isIdle && it.mpos[0] == -200.0 } != true) delay(20) }
+
+        var idleAt = 0L
+        val homed = CompletableDeferred<Pair<Boolean, Long>>()
+        val next = CompletableDeferred<Pair<Boolean, String>>()
+        val t0 = System.currentTimeMillis()
+        link.sendLine("\$H") { ok, _ -> homed.complete(ok to System.currentTimeMillis()) }
+        link.sendLine("G0 X-150") { ok, reply -> next.complete(ok to reply) }
+        withTimeout(5000) { while (link.status.value?.state != "Home") delay(10) }
+        withTimeout(15000) { while (link.status.value?.isIdle != true) delay(10) }
+        idleAt = System.currentTimeMillis()
+        val (ok, at) = withTimeout(3000) { homed.await() }
+        assertTrue("homing took over 4 s (${idleAt - t0} ms)", idleAt - t0 > 4500)
+        assertTrue("\$H ok", ok)
+        assertTrue("\$H answered when homing ended, not before (${idleAt - at} ms early)", at > idleAt - 400)
+        val (ok2, reply2) = withTimeout(3000) { next.await() }
+        assertTrue("next line's own ok: $reply2", ok2)
+        withTimeout(10000) { while (link.status.value?.let { it.isIdle && it.mpos[0] == -150.0 } != true) delay(20) }
+        link.disconnect()
+    }
+
+    /**
+     * Reset during homing: \$H fails ("reset") right away, but the Z1 still sends its "ok" after the
+     * alarm. That late "ok" must not be taken as the next line's reply: in Alarm, the next line gets
+     * "error:Alarm lock".
+     */
+    @Test fun resetSwallowsTheLateReplyOfALineCut() = runBlocking {
+        val link = MakeraLink()
+        link.connect(MachineTarget("sim", "127.0.0.1", port))
+        withTimeout(5000) { while (link.conn.value != ConnState.Connected) delay(20) }
+        val homed = CompletableDeferred<Pair<Boolean, String>>()
+        link.sendLine("\$H") { ok, reply -> homed.complete(ok to reply) }
+        withTimeout(5000) { while (link.status.value?.state != "Home") delay(10) }
+        link.reset()
+        assertEquals(false to "reset", withTimeout(1000) { homed.await() })
+
+        val next = CompletableDeferred<Pair<Boolean, String>>()
+        link.sendLine("G0 X-50") { ok, reply -> next.complete(ok to reply) }
+        val (ok, reply) = withTimeout(5000) { next.await() }
+        assertTrue("the next line got its own reply, not \$H's late ok: $ok $reply", !ok && reply.contains("Alarm lock"))
+        withTimeout(2000) { while (link.status.value?.isAlarm != true) delay(10) }
+
+        val unlock = CompletableDeferred<Boolean>()
+        link.sendLine("\$X") { ok3, _ -> unlock.complete(ok3) }
+        assertTrue("\$X ok", withTimeout(3000) { unlock.await() })
+        withTimeout(3000) { while (link.pendingLines > 0) delay(10) }
+        link.disconnect()
+    }
+
     /** \$H ends at the soft max (-1), like the real Z1, so the first move after homing doesn't alarm. */
     @Test fun moveAfterHomingStaysInsideSoftLimits() = runBlocking {
         val link = MakeraLink()

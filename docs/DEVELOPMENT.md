@@ -200,6 +200,12 @@ can't use them to move the machine.
 - Status has no `H:` field and the firmware sends no periodic `0x71` version packets.
 - G-code and `$` lines get `ok`; shell commands (`version`) reply with text only, so the app waits for
   an `ok` only on G-code / `$` lines. Errors can arrive split across packets.
+- Replies come in order, and some only when the command is done: `$H` gets its `ok` when homing ends
+  (3.9 s even from the home position, 2026-11-15). So the link has no reply timeout: a line out waits
+  for its own reply, and two lines are out at most.
+- A reset (Ctrl-X) during `$H`: `ALARM: Abort during cycle`, `ALARM: Homing fail`, then the `$H`'s `ok`
+  80 ms after the reset. The app fails the lines out at once ("reset") but keeps them in line for up to
+  1 s to take such late replies, and sends nothing new until then.
 - Several TCP clients at once work (Makera Studio, the app, test clients), each getting its own replies.
 - **Upper soft limit = the homed position, machine −1.000.** A move past it alarms ("Soft Endstop X was
   exceeded"); that's why the app's "Z up" goes to `G53 G0 Z-2`, not Z0. The machine homes at power-on.
